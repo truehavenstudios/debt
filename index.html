@@ -431,6 +431,12 @@ table.sched th{text-align:right}
   .tl{grid-template-columns:minmax(0,1fr)}
 }
 .tln .mv{width:auto!important;height:auto!important;background:none!important;border-radius:0!important;display:flex!important}
+/* long debt names: the name gets an ellipsis, the "#n" / focus badge stays visible */
+.card>.band .t{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card>.band .r{flex:none}
+/* exact amount next to the extra slider */
+.numbox{display:inline-flex;align-items:center;gap:4px}
+.numbox .inp{width:100px;text-align:right;padding:4px 8px;font-size:16px}
 </style></head>
 <body data-theme="Sage"><div id="root"></div>
 <script>window.BP_DEMO=true;window.BP_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.BP_VERSION="1.0.0";</script>
@@ -459,17 +465,22 @@ const E = (() => {
   // ------------------------------------------------------------ balances
   // A debt is {balance, asOf, asTs} plus history entries {date, amount, ts, kind:'pay'|'charge'|'inbal'}.
   // 'inbal' = a payment already included in the balance the user typed (counts as paid, not subtracted again).
-  const after = (d, h) => h.date > (d.asOf || "0") || (h.date === d.asOf && (h.ts || 0) > (d.asTs || 0));
-  function bal(d, t) {
+  // h.late = dated before the typed balance but the user said it is NOT in it yet: counts until the balance is typed again.
+  // h.inb (charges) = already in the typed balance: never added again, not counted as a new charge.
+  const after = (d, h) => h.date > (d.asOf || "0") || (h.date === d.asOf && (h.ts || 0) > (d.asTs || 0)) || (!!h.late && (h.ts || 0) > (d.asTs || 0));
+  function rawBal(d, t) {
     let b = +d.balance || 0;
     (d.history || []).forEach(h => {
-      if (h.date > t || !after(d, h)) return;
+      if (h.date > t || h.inb || !after(d, h)) return;
       if (h.kind === "charge") b += +h.amount; else if (h.kind !== "inbal") b -= +h.amount;
     });
-    return Math.max(0, r2(b));
+    return b;
   }
+  const bal = (d, t) => Math.max(0, r2(rawBal(d, t)));
+  // paid beyond zero (an overpayment) – not counted as "paid off"
+  const over = (d, t) => Math.max(0, r2(-rawBal(d, t)));
   const paidIn = (d, from, to) => sum((d.history || []).filter(h => h.kind !== "charge" && h.date >= from && h.date <= to), h => h.amount);
-  const chargedIn = (d, from, to) => sum((d.history || []).filter(h => h.kind === "charge" && h.date >= from && h.date <= to), h => h.amount);
+  const chargedIn = (d, from, to) => sum((d.history || []).filter(h => h.kind === "charge" && !h.inb && h.date >= from && h.date <= to), h => h.amount);
   const paidOffOn = (d, t) => {
     if (bal(d, t) > 0.005) return null;
     const p = (d.history || []).filter(h => h.kind !== "charge" && h.date <= t).sort((a, b) => a.date < b.date ? -1 : 1);
@@ -477,40 +488,56 @@ const E = (() => {
   };
 
   // ------------------------------------------------------------ payoff simulation
+  // sorted by what is owed now (cur), not by the balance at the start of the month
+  const cb = d => d.cur;
   const SORT = {
-    snowball: (a, b) => a.bal - b.bal || b.apr - a.apr,
-    avalanche: (a, b) => b.apr - a.apr || a.bal - b.bal,
-    custom: (a, b) => (a.ord || 99) - (b.ord || 99) || a.bal - b.bal
+    snowball: (a, b) => cb(a) - cb(b) || b.apr - a.apr,
+    avalanche: (a, b) => b.apr - a.apr || cb(a) - cb(b),
+    custom: (a, b) => (a.ord || 99) - (b.ord || 99) || cb(a) - cb(b)
   };
-  // list: [{id, bal (start of this month), apr, min, ord, paid (already paid this month)}]
-  // o: {extra, method, lump (one time, month 1), roll (false = each debt only gets its own minimum)}
+  // list: [{id, bal (start of this month), now (owed today, optional), apr, min, ord, paid (already paid this month)}]
+  // o: {extra, method, lump (one time, month 1), roll (false = each debt only gets its own minimum), actual (false = ignore what's paid), full (keep going for n months even if it never ends)}
+  // Month 1: payments are capped at the balance before interest; a debt paid off in month 1 gets no interest.
+  // Interest on the start-of-month balance is added after the payments for whatever is still open.
   function sim(list, o = {}) {
-    const D = list.filter(d => d.bal > 0.005).map(d => ({ ...d, bal: +d.bal, apr: +d.apr || 0, min: +d.min || 0 }));
-    const res = { months: 0, interest: 0, order: [], payoff: {}, path: [r2(sum(D, d => d.bal))], sched: [], never: false };
+    const real = o.actual !== false;
+    const D = list.filter(d => d.bal > 0.005).map(d => ({ ...d, bal: +d.bal, apr: +d.apr || 0, min: +d.min || 0, cur: d.now != null && real ? +d.now : +d.bal }));
+    const res = { months: 0, interest: 0, order: [], payoff: {}, path: [r2(sum(D, d => d.bal))], sched: [], never: false, why: "" };
     if (!D.length) return res;
-    res.order = [...D].sort(SORT[o.method] || SORT.avalanche).map(d => d.id);
+    // already paid off this month (owed now is 0): not part of the order, the focus or later months
+    const closed = d => real && d.now != null && +d.now <= 0.005;
+    res.order = D.filter(d => !closed(d)).sort(SORT[o.method] || SORT.avalanche).map(d => d.id);
+    const roll = [...D.filter(closed).map(d => d.id), ...res.order];
     const budget = sum(D, d => d.min) + Math.max(0, +o.extra || 0);
+    const cap = o.full || 600;
     let m = 0;
-    while (D.some(d => d.bal > 0.005) && m < 600) {
+    while (D.some(d => d.bal > 0.005) && m < cap) {
       m++;
-      const pay = {};
-      D.forEach(d => { if (d.bal > 0.005) { const i = d.bal * d.apr / 1200; res.interest += i; d.bal += i; } });
+      const pay = {}, int = {};
+      D.forEach(d => { if (d.bal > 0.005) int[d.id] = d.bal * d.apr / 1200; });
+      if (m > 1) D.forEach(d => { if (int[d.id]) { res.interest += int[d.id]; d.bal += int[d.id]; } });
       let pot = o.roll === false ? sum(D.filter(d => d.bal > 0.005), d => d.min) : budget + (m === 1 ? Math.max(0, +o.lump || 0) : 0);
       D.forEach(d => { if (d.bal > 0.005) { const p = Math.min(d.min, d.bal, Math.max(0, pot)); d.bal -= p; pot -= p; pay[d.id] = p; } });
-      if (o.roll !== false) for (const id of res.order) {
+      if (o.roll !== false) for (const id of (m === 1 ? roll : res.order)) {
         const d = D.find(x => x.id === id);
         if (d.bal > 0.005 && pot > 0.005) { const p = Math.min(pot, d.bal); d.bal -= p; pot -= p; pay[id] = (pay[id] || 0) + p; }
       }
-      // this month: what was really paid already counts, even if it's more than the plan
-      if (m === 1 && o.actual !== false) D.forEach(d => { const more = Math.min((+d.paid || 0) - (pay[d.id] || 0), d.bal); if (more > 0.005) { d.bal -= more; pay[d.id] = (pay[d.id] || 0) + more; } });
+      if (m === 1) {
+        // this month: what was really paid already counts, even if it's more than the plan
+        if (real) D.forEach(d => { const more = Math.min((+d.paid || 0) - (pay[d.id] || 0), d.bal); if (more > 0.005) { d.bal -= more; pay[d.id] = (pay[d.id] || 0) + more; } });
+        D.forEach(d => { if (closed(d)) d.bal = 0; if (d.bal > 0.005 && int[d.id]) { res.interest += int[d.id]; d.bal += int[d.id]; } });
+      }
       D.forEach(d => { if (d.bal <= 0.005 && !res.payoff[d.id]) { d.bal = 0; res.payoff[d.id] = m; } });
       Object.keys(pay).forEach(k => { pay[k] = r2(pay[k]); });
       res.sched.push(pay);
       res.path.push(r2(sum(D, d => d.bal)));
-      if (m >= 2 && res.path[m] >= res.path[m - 1] - 0.005) { res.months = Infinity; res.interest = Infinity; res.never = true; return res; }
+      if (!res.never && m >= 2 && res.path[m] >= res.path[m - 1] - 0.005) {
+        res.never = true; res.why = budget - (o.roll === false ? Math.max(0, +o.extra || 0) : 0) <= 0.005 ? "nopay" : "interest";
+        if (!o.full) break;
+      }
     }
-    res.months = m >= 600 ? Infinity : m;
-    if (m >= 600) { res.never = true; res.interest = Infinity; }
+    if (m >= cap && D.some(d => d.bal > 0.005)) res.never = true;
+    if (res.never) { res.months = Infinity; res.interest = Infinity; if (!res.why) res.why = "interest"; } else res.months = m;
     return res;
   }
   // the list for "now": each open debt with its balance at the start of this month
@@ -545,7 +572,8 @@ const E = (() => {
     const ds_ = st.debts || [];
     const owed = r2(sum(ds_, d => bal(d, t)));
     const start = r2(sum(ds_, d => (+d.start || +d.balance || 0)) + sum(ds_, d => chargedIn(d, d.created || "0000", t)));
-    const paid = r2(sum(ds_, d => paidIn(d, "0000-00-00", t)));
+    // paid so far: every payment up to today, minus anything paid beyond zero
+    const paid = r2(sum(ds_, d => Math.max(0, paidIn(d, "0000-00-00", t) - over(d, t))));
     const pct = start > 0 ? Math.min(1, Math.max(0, 1 - owed / start)) : 0;
     const open = ds_.filter(d => bal(d, t) > 0.005), gone = ds_.filter(d => bal(d, t) <= 0.005);
     const interestNow = r2(sum(open, d => bal(d, t) * (+d.apr || 0) / 1200));
@@ -574,10 +602,11 @@ const E = (() => {
       if (m < cur) {
         const was = bal(d, addDays(from, -1)) > 0.005 || paid > 0;
         if (!was) return;
-        out.push({ d, due, amount: paid, status: paid > 0 ? "paid" : (+d.min > 0 ? "missed" : "later") });
+        // a due date before the debt was added to the tracker is never "missed"
+        out.push({ d, due, amount: paid, status: paid > 0 ? "paid" : (+d.min > 0 && due >= (d.created || "0000") ? "missed" : "later") });
       } else if (m === cur) {
         const r = TM.rows.find(x => x.d.id === d.id); if (!r) { if (paid > 0) out.push({ d, due, amount: paid, status: "paid" }); return; }
-        out.push({ d, due, amount: r.done ? r.paid : r.rest, planned: r.planned, paid: r.paid, status: r.later ? "later" : r.done ? "paid" : r.paid > 0 ? "partial" : due < t ? "missed" : "due" });
+        out.push({ d, due, amount: r.done ? r.paid : r.rest, planned: r.planned, paid: r.paid, status: r.later ? "later" : r.done ? "paid" : r.paid > 0 ? "partial" : due < t && due >= (d.created || "0000") ? "missed" : "due" });
       } else {
         const i = (+m.slice(0, 4) - +cur.slice(0, 4)) * 12 + (+m.slice(5, 7) - +cur.slice(5, 7)), row = P.sched[i];
         const a = row ? row[d.id] || 0 : 0; if (a > 0.005) out.push({ d, due, amount: a, status: "planned" });
@@ -588,7 +617,7 @@ const E = (() => {
   const weightedApr = (st, t) => { const o = (st.debts || []).map(d => [bal(d, t), +d.apr || 0]); const b = sum(o, x => x[0]); return b > 0 ? sum(o, x => x[0] * x[1]) / b : 0; };
 
   return { pad, ds, pd, addDays, diff, dim, ym, ymAdd, addMonths, monthStart, monthEnd, r2, sum, dueIn,
-    bal, paidIn, chargedIn, paidOffOn, sim, startList, plan, monthOf, thisMonth, progress, debtPct, SORT, streak, monthEntries, weightedApr };
+    bal, rawBal, over, paidIn, chargedIn, paidOffOn, sim, startList, plan, monthOf, thisMonth, progress, debtPct, SORT, streak, monthEntries, weightedApr };
 })();
 if (typeof module !== "undefined") module.exports = E;
 
@@ -866,6 +895,7 @@ const card = (title, body, o = {}) => `<section class="card ${o.cls || ""}" ${o.
 const tile = (h, v, s = "", sc = "") => `<div class="tile"><div class="h">${h}</div><b>${v}</b><div class="s ${sc}">${s || "&nbsp;"}</div></div>`;
 const countdown = n => { const y = Math.floor(n / 12), m = n % 12; return [y ? `${y} yr${y > 1 ? "s" : ""}` : "", m ? `${m} mo` : ""].filter(Boolean).join(" ") || "this month"; };
 const freeLabel = (t, P) => P.never ? "Not yet" : P.months === 0 ? "Now" : mname(E.monthOf(t, P.months));
+const neverText = P => P.why === "nopay" ? "nothing is being paid yet – add a minimum payment or something extra" : "the payments don't cover the interest yet – add a little extra";
 
 function shell(content) {
   const r = route();
@@ -905,13 +935,13 @@ function vHome() {
   const t = today(), st = S.settings, G = E.progress(S, t);
   if (!S.debts.length) return head(greet(), "Overview") + `<div class="empty">Add your first debt and your debt-free date appears here.<br><br>${addBtn("Add a debt", "newDebt")}</div>`;
   const TM = E.thisMonth(S, t), P = TM.P, P0 = E.plan(S, t, { extra: 0, roll: false, actual: false });
-  const sooner = !P.never && !P0.never ? P0.months - P.months : null, saved = !P.never && !P0.never ? P0.interest - P.interest : null;
+  const live = G.open.length && !P.never && !P0.never, sooner = live ? P0.months - P.months : null, saved = live ? P0.interest - P.interest : null;
   const name = st.name ? ", " + esc(st.name) : "";
   const hero = `<div class="hero"><div class="band">${G.open.length ? "You'll be debt-free in" : "You're debt-free"}</div><div class="in">
     ${ring(G.pct, 118, 11, "var(--b)", Math.round(G.pct * 100) + "%")}
     <div class="bigdate" style="margin-top:10px">${G.open.length ? freeLabel(t, P) : "🕊️ Done"}</div>
-    <div class="line">${G.open.length ? (P.never ? "the payments don't cover the interest yet – add a little extra" : `<b class="cd">${countdown(P.months)}</b> to go · ${G.gone.length} of ${S.debts.length} debts gone`) : `all ${S.debts.length} debts paid off`}</div>
-    <div class="row wrap" style="justify-content:center;gap:6px;margin-top:10px">${sooner > 0 ? `<span class="badge ok">${sooner} months sooner than minimums</span>` : ""}${saved > 1 ? `<span class="badge">${fmt0(saved)} less interest</span>` : ""}</div>
+    <div class="line">${G.open.length ? (P.never ? neverText(P) : `<b class="cd">${countdown(P.months)}</b> to go · ${G.gone.length} of ${S.debts.length} debts gone`) : `all ${S.debts.length} debts paid off`}</div>
+    <div class="row wrap" style="justify-content:center;gap:6px;margin-top:10px">${sooner > 0 ? `<span class="badge ok">${sooner} month${sooner === 1 ? "" : "s"} sooner than minimums</span>` : ""}${saved > 1 ? `<span class="badge">${fmt0(saved)} less interest</span>` : ""}</div>
     <div class="btns"><button class="btn sm pri2" data-act="pay">${ic("plus")}Log a payment</button><a class="btn sm" href="#/plan">See the plan</a></div></div></div>`;
   const rows = TM.rows.map(r => `<div class="item ${r.done || r.later ? "done" : ""} ${r.later ? "later" : ""}">${dateBox(r.due, r.done ? "ok" : r.due < t ? "a" : "")}<div class="grow"><div class="nm">${emojiOf(r.d)} ${esc(r.d.name)}${r.focus && !r.done ? ' <span class="badge b">focus</span>' : ""}</div>
     <div class="tiny muted">${r.later ? `nothing due this month · its turn starts ${(i => i > 0 ? MONTHS[+E.monthOf(t, i + 1).slice(5, 7) - 1] : "soon")(TM.P.sched.findIndex(x => (x[r.d.id] || 0) > 0))}` : r.done ? `paid ${fmt(r.paid)} ✓` : r.paid > 0 ? `${fmt(r.paid)} paid · ${fmt(r.rest)} to go` : `due ${rel(r.due)} · min ${fmt0(r.d.min)}`}</div></div>
@@ -982,13 +1012,29 @@ function totalsCard(t, open, P) {
 }
 
 // ------------------------------------------------------------ payoff plan
+// the slider always reaches past the current amount (and past the minimums)
+const extraMax = (extra, mins) => Math.max(500, Math.ceil(Math.max((+extra || 0) * 2, mins) / 100) * 100);
+const planSub = P => P.never ? neverText(P) : `in ${P.months} month${P.months === 1 ? "" : "s"} · about ${fmt0(P.interest)} interest`;
+function planBadges(P, P0) {
+  const sooner = !P.never && !P0.never ? P0.months - P.months : null, saved = !P.never && !P0.never ? P0.interest - P.interest : null;
+  return `${sooner > 0 ? `<span class="badge ok">${sooner} month${sooner === 1 ? "" : "s"} sooner than minimums only</span>` : ""}${saved > 1 ? `<span class="badge">${fmt0(saved)} less interest</span>` : ""}`;
+}
+// while a slider moves: update the numbers in place
+function planLive() {
+  if (route() !== "plan" || !$("#pDate")) return render();
+  const t = today(), P = E.plan(S, t, { lump: VS.lump }), P0 = E.plan(S, t, { extra: 0, roll: false, actual: false });
+  $("#pDate").textContent = freeLabel(t, P); $("#pSub").textContent = planSub(P); $("#pBadges").innerHTML = planBadges(P, P0);
+  const l = $("#pLump"); if (l) l.textContent = fmt0(VS.lump);
+}
 function vPlan() {
   const t = today(), st = S.settings;
-  if (!E.startList(S, t).length) return head("Your way out", "Payoff plan") + `<div class="empty">${S.debts.length ? "Every debt is paid off – there's nothing left to plan. 🕊️" : "Add a debt to see your plan."}</div>`;
+  if (!E.startList(S, t).some(x => x.now > 0.005)) return head("Your way out", "Payoff plan") + `<div class="empty">${S.debts.length ? "Every debt is paid off – there's nothing left to plan. 🕊️" : "Add a debt to see your plan."}</div>`;
   const P = E.plan(S, t, { lump: VS.lump }), P0 = E.plan(S, t, { extra: 0, roll: false, actual: false }), L = E.startList(S, t);
-  const mins = E.sum(L, d => d.min), sooner = !P.never && !P0.never ? P0.months - P.months : null, saved = !P.never && !P0.never ? P0.interest - P.interest : null;
+  const mins = E.sum(L.filter(d => d.now > 0.005), d => d.min);
   const n = Math.min(Math.max(P.path.length, P0.never ? P.path.length * 2 : P0.path.length), 361);
-  const v1 = Array.from({ length: n }, (_, i) => P.path[i] ?? 0), v0 = Array.from({ length: n }, (_, i) => P0.path[Math.min(i, P0.path.length - 1)] ?? 0);
+  // minimums only never ends: keep simulating it so the dashed line shows the balance growing, not a flat line
+  const P0p = P0.never ? E.plan(S, t, { extra: 0, roll: false, actual: false, full: n }).path : P0.path;
+  const v1 = Array.from({ length: n }, (_, i) => P.path[i] ?? 0), v0 = Array.from({ length: n }, (_, i) => P0p[Math.min(i, P0p.length - 1)] ?? 0);
   const lbl = i => mshort(E.monthOf(t, Math.max(1, i)));
   const chart = lineChart(v1, { h: 220, vals2: v0, color: "var(--a)", labels: [[0, "Now"], [Math.floor((n - 1) / 2), lbl(Math.floor((n - 1) / 2))], [n - 1, lbl(n - 1)]], tips: i => `${lbl(i)} · ${fmt0(v1[i])} left with your plan`, label: "What you owe over time" });
   const methods = [["snowball", "❄️ Snowball", "smallest balance first – quick wins"], ["avalanche", "🔥 Avalanche", "highest interest first – least interest"], ["custom", "✋ My order", "the order you choose"]];
@@ -997,16 +1043,17 @@ function vPlan() {
   const tot = P.never ? 60 : Math.max(1, P.months);
   const tl = P.order.map((id, i) => { const d = S.debts.find(x => x.id === id), m = P.payoff[id] || tot; return `<div class="tl"><div class="tln"><span>${i + 1}</span><b class="grow" style="font-weight:500;overflow:hidden;text-overflow:ellipsis">${esc(d.name)}</b><span class="mv"><button class="iconbtn" data-act="mv" data-id="${id}" data-v="-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>${ic("up2")}</button><button class="iconbtn" data-act="mv" data-id="${id}" data-v="1" aria-label="Move down" ${i === P.order.length - 1 ? "disabled" : ""}>${ic("down2")}</button></span></div><div class="tlb"><i style="width:${(m / tot * 100).toFixed(1)}%;background:${PAL[i % 10]}"></i><b style="left:min(calc(${(m / tot * 100).toFixed(1)}% + 6px),calc(100% - 64px))">${P.payoff[id] ? mshort(E.monthOf(t, m)) : "–"}</b></div></div>`; }).join("");
   // month by month
-  const cols = P.order.map(id => S.debts.find(x => x.id === id));
+  // debts paid off this month aren't in the order any more, but this month's row still shows what went to them
+  const cols = [...Object.keys(P.sched[0] || {}).filter(id => !P.order.includes(id)), ...P.order].map(id => S.debts.find(x => x.id === id)).filter(Boolean);
   const rowsN = VS.all ? P.sched.length : Math.min(12, P.sched.length);
   const table = `<div class="scrollx"><table class="t sched"><tr><th>Month</th>${cols.map(d => `<th>${esc(d.name)}</th>`).join("")}<th>Total</th><th>Still owed</th></tr>
     ${P.sched.slice(0, rowsN).map((row, i) => `<tr class="${i === 0 ? "cur" : ""}"><td>${mshort(E.monthOf(t, i + 1))}</td>${cols.map(d => { const v = row[d.id] || 0, end = P.payoff[d.id] === i + 1; return `<td class="${end ? "fin" : ""}">${v > 0.005 ? fmt0(v) + (end ? " 🎉" : "") : "–"}</td>`; }).join("")}<td><b>${fmt0(E.sum(Object.values(row)))}</b></td><td>${fmt0(P.path[i + 1])}</td></tr>`).join("")}</table></div>
     ${P.sched.length > 12 ? `<button class="link" data-act="allMonths" style="margin-top:10px">${VS.all ? "Show the first 12 months" : `Show all ${P.sched.length} months`}</button>` : ""}`;
   return head("Your way out", "Payoff plan", "", "Pick a method, add what extra you can – see your date move.") +
-    `<div class="grid g12"><div class="hero"><div class="band">Debt-free</div><div class="in"><div class="bigdate">${freeLabel(t, P)}</div><div class="muted small" style="margin-top:4px">${P.never ? "the payments don't cover the interest – add a little extra" : `in ${P.months} months · about ${fmt0(P.interest)} interest`}</div>
-      <div class="slider"><div class="row sb small"><span>Extra each month</span><b class="serif">${fmt0(st.extra)}</b></div><input type="range" id="extra" min="0" max="${Math.max(500, Math.ceil(mins / 100) * 100)}" step="10" value="${st.extra}"><div class="tiny faint">on top of ${fmt0(mins)} in minimums</div></div>
-      <div class="slider"><div class="row sb small"><span>What if I paid once, now…</span><b class="serif">${fmt0(VS.lump)}</b></div><input type="range" id="lump" min="0" max="${Math.max(1000, Math.ceil(E.sum(L, d => d.bal) / 4 / 500) * 500)}" step="50" value="${VS.lump}"><div class="tiny faint">a tax refund, a bonus – just to see (not saved)</div></div>
-      <div class="row wrap" style="justify-content:center;gap:6px;margin-top:10px">${sooner > 0 ? `<span class="badge ok">${sooner} months sooner than minimums only</span>` : ""}${saved > 1 ? `<span class="badge">${fmt0(saved)} less interest</span>` : ""}</div></div></div>
+    `<div class="grid g12"><div class="hero"><div class="band">Debt-free</div><div class="in"><div class="bigdate" id="pDate">${freeLabel(t, P)}</div><div class="muted small" id="pSub" style="margin-top:4px">${planSub(P)}</div>
+      <div class="slider"><div class="row sb small"><label for="extraN">Extra each month</label><span class="numbox"><span class="tiny muted">${esc(symbol())}</span><input class="inp sm" id="extraN" inputmode="decimal" value="${E.r2(+st.extra || 0)}" aria-label="Extra each month"></span></div><input type="range" id="extra" min="0" max="${extraMax(st.extra, mins)}" step="5" value="${st.extra}" aria-label="Extra each month slider"><div class="tiny faint">on top of ${fmt0(mins)} in minimums</div></div>
+      <div class="slider"><div class="row sb small"><span>What if I paid once, now…</span><b class="serif" id="pLump">${fmt0(VS.lump)}</b></div><input type="range" id="lump" min="0" max="${Math.max(1000, Math.ceil(E.sum(L, d => d.bal) / 4 / 500) * 500, Math.ceil(VS.lump / 500) * 500)}" step="50" value="${VS.lump}" aria-label="One-time payment"><div class="tiny faint">a tax refund, a bonus – just to see (not saved)</div></div>
+      <div class="row wrap" id="pBadges" style="justify-content:center;gap:6px;margin-top:10px">${planBadges(P, P0)}</div></div></div>
       ${card("What you owe over time", chart + `<div class="hleg"><span><i style="background:var(--a)"></i>your plan</span><span><i style="background:none;border-top:2px dashed var(--ink3);height:0;width:14px;border-radius:0"></i>minimums only</span></div>`, { b: true })}</div>
     <div class="grid g3 mt">${comp}</div>
     ${card("When each one is gone", `<div class="tls">${tl}</div><p class="tiny faint" style="margin:10px 0 0">Use the arrows to choose your own order (it switches to “My order”). When one is paid off, its payment rolls over to the next. Interest is added each month, so the dates are a close estimate – update your balances now and then.</p>`, { cls: "mt" })}
@@ -1020,17 +1067,23 @@ function recordHist() {
   if (S.hist[k] == null || Math.abs(S.hist[k] - v) > .5) { S.hist[k] = v; save(); }
 }
 function owedChart(t, G, P) {
-  const keys = Object.keys(S.hist).filter(k => k < E.ym(t)).sort().slice(-24);
-  const act = keys.map(k => S.hist[k]).concat([G.owed]), proj = P.path.slice(1, 1 + Math.max(6, Math.min(72, P.months === Infinity ? 12 : P.months)));
-  const all = act.concat(proj), n = all.length, W = 640, H = 220, Lx = 56, T = 12, B = 24, w = W - Lx - 10, h = H - T - B;
-  const hi = niceMax(Math.max(1, ...all)), X = i => Lx + (n > 1 ? w * i / (n - 1) : w / 2), Y = v => T + h - h * v / hi;
-  const a = act.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("");
-  const p = [act.length - 1, ...proj.map((_, i) => act.length + i)].map((i, k) => `${k ? "L" : "M"}${X(i).toFixed(1)},${Y(all[i]).toFixed(1)}`).join("");
-  const lab = i => i < act.length - 1 ? mshort(keys[i]) : mshort(E.ymAdd(E.ym(t), i - act.length + 1));
+  // x = real months (a skipped month leaves a gap, it doesn't squeeze the line)
+  const cm = E.ym(t), off = k => (+k.slice(0, 4) - +cm.slice(0, 4)) * 12 + (+k.slice(5, 7) - +cm.slice(5, 7));
+  const keys = Object.keys(S.hist).filter(k => /^\d{4}-\d\d$/.test(k) && k < cm && isFinite(+S.hist[k])).sort().slice(-24);
+  const act = keys.map(k => [off(k), +S.hist[k]]).concat([[0, G.owed]]);
+  const proj = P.path.slice(1, 1 + Math.max(6, Math.min(72, P.never ? 12 : P.months))).map((v, i) => [i + 1, v]);
+  const all = act.concat(proj), lo = act[0][0], hiX = all[all.length - 1][0], W = 640, H = 220, Lx = 56, T = 12, B = 24, w = W - Lx - 10, h = H - T - B;
+  const hi = niceMax(Math.max(1, ...all.map(x => x[1]))), X = o => Lx + (hiX > lo ? w * (o - lo) / (hiX - lo) : w / 2), Y = v => T + h - h * v / hi;
+  const line = pts => pts.map(([o, v], k) => `${k ? "L" : "M"}${X(o).toFixed(1)},${Y(v).toFixed(1)}`).join("");
+  const a = line(act), p = line([act[act.length - 1], ...proj]);
+  const lab = o => mshort(E.ymAdd(cm, o));
   let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="What you owe, month by month">` + axisY(hi, 0, h, T, Lx, w);
-  svg += `<path d="${a}L${X(act.length - 1)},${Y(0)}L${X(0)},${Y(0)}Z" fill="var(--b1)" opacity=".8"/><path d="${a}" fill="none" stroke="var(--b)" stroke-width="2.6"/><path d="${p}" fill="none" stroke="var(--a)" stroke-width="2.2" stroke-dasharray="6 5"/>`;
-  act.forEach((v, i) => { svg += `<circle cx="${X(i)}" cy="${Y(v)}" r="${i === act.length - 1 ? 5 : 3.4}" fill="var(--b)" stroke="var(--card)" stroke-width="1.5" data-tip="${esc(lab(i) + " · " + fmt0(v) + " owed")}"/>`; });
-  [[0, "start"], [act.length - 1, "middle"], [n - 1, "end"]].forEach(([i, an]) => { if (i >= 0 && (i !== act.length - 1 || (act.length > 1 && i !== n - 1))) svg += `<text x="${X(i)}" y="${H - 6}" text-anchor="${an}">${esc(i === act.length - 1 ? "Now" : lab(i))}</text>`; });
+  svg += `<path d="${a}L${X(0)},${Y(0)}L${X(lo)},${Y(0)}Z" fill="var(--b1)" opacity=".8"/><path d="${a}" fill="none" stroke="var(--b)" stroke-width="2.6"/><path d="${p}" fill="none" stroke="var(--a)" stroke-width="2.2" stroke-dasharray="6 5"/>`;
+  act.forEach(([o, v]) => { svg += `<circle cx="${X(o)}" cy="${Y(v)}" r="${o === 0 ? 5 : 3.4}" fill="var(--b)" stroke="var(--card)" stroke-width="1.5" data-tip="${esc(lab(o) + " · " + fmt0(v) + " owed")}"/>`; });
+  const marks = [[lo, "start", lo === 0 ? "Now" : lab(lo)]];
+  if (lo < 0 && hiX > 0 && X(0) - X(lo) > 60 && X(hiX) - X(0) > 60) marks.push([0, "middle", "Now"]);
+  if (hiX > lo) marks.push([hiX, "end", lab(hiX)]);
+  marks.forEach(([o, an, tx]) => { svg += `<text x="${X(o)}" y="${H - 6}" text-anchor="${an}">${esc(tx)}</text>`; });
   return svg + `</svg><div class="hleg"><span><i style="background:var(--b)"></i>what you owed</span><span><i style="background:none;border-top:2px dashed var(--a);height:0;width:14px;border-radius:0"></i>your plan from here</span></div>`;
 }
 function vProgress() {
@@ -1039,14 +1092,15 @@ function vProgress() {
   const M = milestones(G);
   const ms = `<div class="list">${M.map(m => `<div class="item ${m[1] ? "" : "todo"}"><div class="emo ${m[1] ? "okbg" : ""}">${m[1] ? "✓" : "○"}</div><div class="grow"><div class="nm">${m[0]}</div>${!m[1] && m[2] > 0 ? `<div class="tiny muted">${fmt0(m[2])} to go</div>` : ""}</div>${m[1] ? '<span class="badge ok">done</span>' : ""}</div>`).join("")}</div>`;
   const pays = S.debts.filter(d => VS.hf === "all" || d.id === VS.hf).flatMap(d => (d.history || []).map(h => ({ ...h, d }))).sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (b.ts || 0) - (a.ts || 0));
-  const hist = pays.length ? `<div class="list">${pays.slice(0, 15).map(x => `<div class="item click" data-act="editDebt" data-id="${x.d.id}">${dateBox(x.date, x.kind === "charge" ? "a" : "b")}<div class="grow"><div class="nm">${esc(x.d.name)}</div><div class="tiny muted">${x.kind === "charge" ? "new charge" : x.kind === "inbal" ? "paid · already in balance" : "payment"}${x.note ? " · " + esc(x.note) : ""}</div></div><span class="amt ${x.kind === "charge" ? "badc" : "okc"}">${x.kind === "charge" ? "+" : "−"}${fmt(x.amount)}</span></div>`).join("")}</div>${pays.length > 15 ? `<p class="tiny faint">The last 15 – tap a debt to see all of its payments.</p>` : ""}` : `<div class="empty">Your payments show up here.</div>`;
+  const hist = pays.length ? `<div class="list">${pays.slice(0, 15).map(x => `<div class="item click" data-act="editDebt" data-id="${x.d.id}">${dateBox(x.date, x.kind === "charge" ? "a" : "b")}<div class="grow"><div class="nm">${esc(x.d.name)}</div><div class="tiny muted">${x.kind === "charge" ? (x.inb ? "new charge · already in balance" : "new charge") : x.kind === "inbal" ? "paid · already in balance" : "payment"}${x.note ? " · " + esc(x.note) : ""}</div></div><span class="amt ${x.kind === "charge" ? "badc" : "okc"}">${x.kind === "charge" ? "+" : "−"}${fmt(x.amount)}</span></div>`).join("")}</div>${pays.length > 15 ? `<p class="tiny faint">The last 15 – tap a debt to see all of its payments.</p>` : ""}` : `<div class="empty">Your payments show up here.</div>`;
   const hfilter = `<div class="row wrap" style="gap:6px;padding:8px 0 4px"><button class="cat ${VS.hf === "all" ? "on" : ""}" data-act="hf" data-v="all">All debts</button>${S.debts.filter(d => (d.history || []).length).map(d => `<button class="cat ${VS.hf === d.id ? "on" : ""}" data-act="hf" data-v="${d.id}">${emojiOf(d)} ${esc(d.name)}</button>`).join("")}</div>`;
   const P0 = E.plan(S, t, { extra: 0, roll: false, actual: false }), saved = !P.never && !P0.never ? Math.max(0, P0.interest - P.interest) : null, streak = E.streak(S, t);
   const icmp = !P0.never && !P.never && G.open.length ? barChart([{ name: "interest", color: "var(--b)", colors: ["var(--ink3)", "var(--b)"], vals: [P0.interest, P.interest] }], ["Minimums only", "Your plan"], { w: 420, h: 210, label: "Interest: minimums only vs your plan", fv: fmt0 }) +
-    `<p class="small" style="margin:8px 0 0">Your plan saves about <b>${fmt0(saved)}</b> in interest and gets you out <b>${countdown(P0.months - P.months)}</b> sooner.</p>` : `<div class="empty">${G.open.length ? "Add a minimum payment to compare." : "All paid off – no more interest. 🕊️"}</div>`;
+    `<p class="small" style="margin:8px 0 0">${(w => w.length ? "Your plan " + w.join(" and ") + "." : "Right now your plan is the minimums. Add something extra each month on the Payoff plan to pay less interest and finish sooner.")([saved >= 1 ? `saves about <b>${fmt0(saved)}</b> in interest` : "", P0.months > P.months ? `gets you out <b>${countdown(P0.months - P.months)}</b> sooner` : ""].filter(Boolean))}</p>` :
+    `<div class="empty">${!G.open.length ? "All paid off – no more interest. 🕊️" : P.never ? neverText(P) : P0.never && P0.why !== "nopay" ? "With only the minimums this would never be paid off – your plan gets you out." : "Add a minimum payment to compare."}</div>`;
   return head("Look how far you've come", "Progress", `<button class="btn" data-act="exportCsv">${ic("file")}Payments for Excel</button>`) +
     `<div class="grid g12 start">${card("Color it in", `<div class="cbig">${colorGrid(G.pct, G.start)}</div><div class="row sb wrap mt" style="margin-top:12px"><div><div class="serif" style="font-size:1.9em;line-height:1">${Math.round(G.pct * 100)}% <span class="small muted" style="font-family:var(--sans)">colored in</span></div><div class="tiny muted">${fmt0(G.paid)} paid · each shape is ${fmt0(G.start / 100)}</div></div>${shapes}</div>`)}
-      <div class="col">${card("What you owe, month by month", owedChart(t, G, P), { b: true })}<div class="tiles t3">${tile("Paid so far", fmt0(G.paid), "", "ok")}${tile("Still owed", fmt0(G.owed), `from ${fmt0(G.start)}`)}${tile("Debt-free", P.never ? "–" : G.open.length ? mshort(E.monthOf(t, P.months)) : "🕊️", G.open.length ? countdown(P.months) + " to go" : "done")}
+      <div class="col">${card("What you owe, month by month", owedChart(t, G, P), { b: true })}<div class="tiles t3">${tile("Paid so far", fmt0(G.paid), "", "ok")}${tile("Still owed", fmt0(G.owed), `from ${fmt0(G.start)}`)}${tile("Debt-free", P.never ? "–" : G.open.length ? mshort(E.monthOf(t, P.months)) : "🕊️", G.open.length ? (P.never ? (P.why === "nopay" ? "add a payment" : "add a little extra") : countdown(P.months) + " to go") : "done")}
         ${tile("Interest saved", saved != null ? fmt0(saved) : "–", "vs minimums only", "ok")}${tile("Payment streak", `${streak} mo`, streak ? "in a row – keep it going" : "log a payment to start", streak ? "ok" : "")}${tile("Debts cleared", `${G.gone.length} / ${S.debts.length}`, G.gone.length ? "nice work" : "the first is closest")}</div></div></div>
     <div class="grid g2 mt start"><div class="col">${card("Interest: your plan vs minimums only", icmp)}${card("Milestones", ms, { tight: true, b: true })}</div>${card("Payment history", hfilter + hist, { tight: true })}</div>`;
 }
@@ -1076,7 +1130,21 @@ function vCalendar() {
 }
 
 /* forms: helpers, add/edit debt, log a payment, update balance, history, calendar file */
-const num = v => { if (v == null) return NaN; let s = String(v).trim().replace(/[^\d,.\-]/g, ""); if (/,\d{1,2}$/.test(s) && !/\.\d/.test(s)) s = s.replace(/\./g, "").replace(",", "."); else s = s.replace(/,/g, ""); return parseFloat(s); };
+// numbers as people type them: 1,234.56 · 1.234,56 · 1'234.50 · 1 234,56 · 8.500 · 12,5
+// both separators: the last one is the decimal point; a single . or , followed by exactly 3 digits is a thousands separator
+const num = v => {
+  if (v == null) return NaN;
+  let s = String(v).trim().replace(/[\s'’\u00a0\u202f]/g, "").replace(/[^\d,.\-]/g, "");
+  const neg = /^-/.test(s); s = s.replace(/-/g, "");
+  const lc = s.lastIndexOf(","), ld = s.lastIndexOf(".");
+  if (lc >= 0 && ld >= 0) { const dec = lc > ld ? "," : "."; s = s.split(dec === "," ? "." : ",").join(""); s = s.replace(dec, "."); }
+  else if (lc >= 0 || ld >= 0) {
+    const parts = s.split(lc >= 0 ? "," : ".");
+    if (parts.length > 2 || (parts[1].length === 3 && /[1-9]/.test(parts[0]))) s = parts.join("");
+    else s = parts.join(".");
+  }
+  const n = parseFloat(s); return neg ? -n : n;
+};
 const val = id => { const el = document.getElementById(id); return el ? el.value : ""; };
 const opt = (v, l, sel) => `<option value="${esc(v)}" ${String(v) === String(sel) ? "selected" : ""}>${esc(l)}</option>`;
 const field = (label, inner, help = "") => `<div class="field"><label>${label}</label>${inner}${help ? `<div class="help">${help}</div>` : ""}</div>`;
@@ -1106,7 +1174,7 @@ function debtModal(d) {
 function historyList(d) {
   const h = [...(d.history || [])].sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (b.ts || 0) - (a.ts || 0));
   if (!h.length) return `<p class="help">No payments logged yet.</p>`;
-  return `<div class="caps" style="margin:6px 0 2px">Payments</div><div class="list">${h.slice(0, 40).map(x => `<div class="item"><div class="grow"><div class="nm small">${x.kind === "charge" ? "New charge" : x.kind === "inbal" ? "Paid (already in balance)" : "Payment"}${x.note ? ` · <span class="muted">${esc(x.note)}</span>` : ""}</div><div class="tiny muted">${dshort(x.date)} ${x.date.slice(0, 4)}</div></div><span class="amt ${x.kind === "charge" ? "badc" : "okc"}">${x.kind === "charge" ? "+" : "−"}${fmt(x.amount)}</span><button class="iconbtn" data-act="delPay" data-id="${d.id}" data-h="${x.id}" aria-label="Delete">${ic("trash")}</button></div>`).join("")}</div>`;
+  return `<div class="caps" style="margin:6px 0 2px">Payments</div><div class="list">${h.slice(0, 40).map(x => `<div class="item"><div class="grow"><div class="nm small">${x.kind === "charge" ? (x.inb ? "New charge (already in balance)" : "New charge") : x.kind === "inbal" ? "Paid (already in balance)" : "Payment"}${x.note ? ` · <span class="muted">${esc(x.note)}</span>` : ""}</div><div class="tiny muted">${dshort(x.date)} ${x.date.slice(0, 4)}</div></div><span class="amt ${x.kind === "charge" ? "badc" : "okc"}">${x.kind === "charge" ? "+" : "−"}${fmt(x.amount)}</span><button class="iconbtn" data-act="delPay" data-id="${d.id}" data-h="${x.id}" aria-label="Delete">${ic("trash")}</button></div>`).join("")}</div>`;
 }
 function saveDebt(id) {
   const t = today(), name = val("dN").trim(), b = num(val("dB")), min = num(val("dM")) || 0, due = clamp(parseInt(val("dD")) || 1, 1, 31), st = num(val("dS"));
@@ -1118,10 +1186,22 @@ function saveDebt(id) {
     else {
       Object.assign(d, base);
       if (Math.abs(E.bal(d, t) - b) > .004) Object.assign(d, { balance: E.r2(b), asOf: t, asTs: now() });
-      d.start = st > 0 ? E.r2(st) : Math.max(d.start || 0, d.balance);
+      if (st > 0) d.start = E.r2(st);
+      fitStart(d, t);
     }
   }, id ? "edit debt" : "add debt");
   closeModal(); render(); if (!id) toast(`${esc(name)} added.`, () => undo());
+}
+
+// the starting balance plus logged charges is never below a balance the user typed (charges are not counted twice)
+function fitStart(d, t) {
+  const c = E.chargedIn(d, d.created || "0000", t);
+  if ((+d.balance || 0) > (+d.start || 0) + c + .004) d.start = E.r2(d.balance - c);
+}
+// a payment that is already inside a balance typed when the debt was added happened before the tracker's start:
+// raise the start so "paid so far", the % and what's owed agree
+function inbalStart(d, h) {
+  if (h.kind === "inbal" && d.asOf === d.created && Math.abs((+d.start || 0) - (+d.balance || 0)) < .005) { d.start = E.r2((+d.start || 0) + h.amount); h.bump = true; }
 }
 
 // ------------------------------------------------------------ log a payment or a new charge
@@ -1140,19 +1220,35 @@ function payModal(id, amount) {
   const a = $("#pA"); a && a.addEventListener("keydown", e => { if (e.key === "Enter") ACT.savePay(); });
 }
 const planBtn = (id, rest) => rest > 0.005 ? `<button data-act="payFill" data-v="${rest}">This month's plan: ${fmt(rest)}</button>` : "";
+let PEND = null;
 function savePay() {
   const a = num(val("pA")); if (!(a > 0)) return bad("Type an amount.");
   const d = S.debts.find(x => x.id === PAYD); if (!d) return bad("Pick a debt.");
-  addEntry(d, { kind: PAYK, amount: E.r2(a), date: val("pD") || today(), note: val("pN").trim().slice(0, 60) });
-  closeModal();
+  const date = /^\d{4}-\d\d-\d\d$/.test(val("pD")) ? val("pD") : today();
+  PEND = { id: d.id, h: { kind: PAYK, amount: E.r2(a), date, note: val("pN").trim().slice(0, 60) } };
+  payCheck();
+}
+// before saving: a date before the balance was typed? more than what's owed?
+function payCheck(step) {
+  const d = S.debts.find(x => x.id === PEND.id), h = PEND.h, t = today(), charge = h.kind === "charge";
+  if (!step && h.date < (d.asOf || "")) return modal(charge ? "Is this charge already in the balance?" : "Is this payment already in the balance?",
+    `<p class="small" style="margin-top:0">You typed what you owe on <b>${esc(d.name)}</b> on ${dshort(d.asOf)} ${d.asOf.slice(0, 4)}. This ${charge ? "charge" : "payment"} is from ${dshort(h.date)} ${h.date.slice(0, 4)} – before that.</p>`,
+    `<button class="btn" data-act="payAsk" data-v="no">No – ${charge ? "add it" : "take it off"}</button><button class="btn pri" data-act="payAsk" data-v="yes">Yes, it's already in there</button>`);
+  if (step !== "over" && h.kind === "pay") {
+    const owe = E.bal(d, h.date > t ? h.date : t);
+    if (h.amount > owe + .004) return modal("That's more than you owe", `<p class="small" style="margin-top:0"><b>${esc(d.name)}</b> has ${fmt(owe)} left${h.date > t ? ` on ${dshort(h.date)}` : ""}. Log ${fmt(owe)} – it's paid off – or the full ${fmt(h.amount)}?</p><p class="tiny muted">Anything above what's owed doesn't count as paid off.</p>`,
+      `<button class="btn" data-act="payOver" data-v="all">Log ${fmt(h.amount)}</button>${owe > .004 ? `<button class="btn pri" data-act="payOver" data-v="cap">Log ${fmt(owe)}</button>` : ""}`);
+  }
+  closeModal(); const p = PEND; PEND = null;
+  addEntry(S.debts.find(x => x.id === p.id), p.h);
 }
 // adds a history entry, then celebrates whatever it unlocked
 function addEntry(d, h) {
   const t = today(), before = E.progress(S, t), wasOpen = E.bal(d, t) > 0.005;
-  commit(() => { d.history = d.history || []; d.history.push({ id: uid(), ts: now(), ...h }); }, h.kind === "charge" ? "charge" : "payment");
+  commit(() => { d.history = d.history || []; const e = { id: uid(), ts: now(), ...h }; d.history.push(e); inbalStart(d, e); }, h.kind === "charge" ? "charge" : "payment");
   const after = E.progress(S, t), gone = wasOpen && E.bal(d, t) <= 0.005;
   if (h.kind === "charge") return toast(`+${fmt(h.amount)} added to ${esc(d.name)}.`, () => undo());
-  const ms = [10, 25, 50, 75, 90].find(p => before.pct * 100 < p && after.pct * 100 >= p);
+  const ms = [90, 75, 50, 25, 10].find(p => before.pct * 100 < p && after.pct * 100 >= p);
   if (!after.open.length && gone) { confetti(); toast(`🕊️ You're debt-free. You did it.`); }
   else if (gone) { confetti(); toast(`🎉 ${esc(d.name)} is paid off!`, () => undo()); }
   else if (ms) { confetti(true); toast(`✨ ${ms}% of your debt is paid off!`, () => undo()); }
@@ -1170,12 +1266,16 @@ function icsFile() {
   const t = today(), open = S.debts.filter(d => E.bal(d, t) > 0.005);
   if (!open.length) return toast("No open debts to add.");
   const stamp = new Date(now()).toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
-  const ev = open.map(d => {
-    let first = E.dueIn(E.ym(t), d.dueDay || 1); if (first < t) first = E.dueIn(E.ymAdd(E.ym(t), 1), d.dueDay || 1);
-    const day = Math.min(d.dueDay || 1, 28), dt = first.replace(/-/g, "");
-    return ["BEGIN:VEVENT", `UID:${d.id}-due@truehaven-debt`, `DTSTAMP:${stamp}`, `DTSTART;VALUE=DATE:${dt}`, `RRULE:FREQ=MONTHLY;BYMONTHDAY=${(d.dueDay || 1) > 28 ? -1 : day}`,
-      `SUMMARY:${(d.name + " payment due").replace(/[,;]/g, " ")}`, `DESCRIPTION:Minimum ${fmt(d.min).replace(/[,;]/g, "")} – log it in your Debt Payoff Tracker`,
+  // day 1–28 and 31 (= last day): one monthly event. Day 29/30: that day in every month but February, plus February's last day every year
+  // (a calendar skips months that don't have the 29th/30th, while the tracker moves the due date to the month's last day)
+  const ev = open.flatMap(d => {
+    const day = clamp(d.dueDay || 1, 1, 31), mk = (uid, first, rule) => ["BEGIN:VEVENT", `UID:${d.id}-${uid}@truehaven-debt`, `DTSTAMP:${stamp}`, `DTSTART;VALUE=DATE:${first.replace(/-/g, "")}`, `RRULE:${rule}`,
+      `SUMMARY:${(d.name + " payment due").replace(/[,;\\]/g, " ")}`, `DESCRIPTION:Minimum ${fmt(d.min).replace(/[,;\\]/g, "")} – log it in your Debt Payoff Tracker`,
       "BEGIN:VALARM", "TRIGGER:-P2D", "ACTION:DISPLAY", "DESCRIPTION:Payment due in 2 days", "END:VALARM", "END:VEVENT"].join("\r\n");
+    const next = ok => { for (let k = 0; k < 30; k++) { const m = E.ymAdd(E.ym(t), k), x = E.dueIn(m, day); if (x >= t && ok(m)) return x; } return E.dueIn(E.ym(t), day); };
+    if (day <= 28 || day === 31) return [mk("due", next(() => true), `FREQ=MONTHLY;BYMONTHDAY=${day === 31 ? -1 : day}`)];
+    return [mk("due", next(m => m.slice(5) !== "02"), day === 29 ? "FREQ=MONTHLY;BYMONTH=1,3,4,5,6,7,8,9,10,11,12;BYMONTHDAY=29" : "FREQ=MONTHLY;BYMONTHDAY=30"),
+      mk("due-feb", next(m => m.slice(5) === "02"), "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=-1")];
   });
   download(new Blob([["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TrueHaven Studios//Debt Payoff Tracker//EN", "CALSCALE:GREGORIAN", ...ev, "END:VCALENDAR"].join("\r\n")], { type: "text/calendar" }), "debt-due-dates.ics");
   toast("Calendar file downloaded – open it to add the due dates (with a reminder 2 days before).");
@@ -1280,7 +1380,7 @@ function obFinish() {
     const b = E.r2(num(r.balance)), name = r.name.trim().slice(0, 40);
     S.debts.push({ id: uid(), name, type: guessType(name), balance: b, start: b, asOf: t, asTs: now(), created: t, apr: Math.max(0, num(r.apr) || 0), min: E.r2(Math.max(0, num(r.min) || 0)), dueDay: clamp(parseInt(r.due) || 1, 1, 31), order: i + 1, history: [] });
   });
-  S.settings.extra = Math.max(0, Math.round(num(OB.d.extra) || 0)); S.settings.method = OB.d.method || S.settings.method;
+  S.settings.extra = E.r2(Math.max(0, num(OB.d.extra) || 0)); S.settings.method = OB.d.method || S.settings.method;
   S.hist[E.ym(t)] = E.r2(E.sum(S.debts, d => d.balance));
   S.setup = true; save(); go("home"); render(); confetti(true);
 }
@@ -1307,7 +1407,7 @@ function restore() {
 function exportCsv() {
   const rows = [["Date", "Debt", "Type", "Amount", "Note"]];
   S.debts.flatMap(d => (d.history || []).map(h => ({ ...h, d }))).sort((a, b) => a.date < b.date ? -1 : 1)
-    .forEach(x => rows.push([x.date, x.d.name, x.kind === "charge" ? "New charge" : "Payment", (x.kind === "charge" ? 1 : -1) * x.amount, x.note || ""]));
+    .forEach(x => rows.push([x.date, x.d.name, x.kind === "charge" ? (x.inb ? "New charge (already in balance)" : "New charge") : x.kind === "inbal" ? "Payment (already in balance)" : "Payment", (x.kind === "charge" ? 1 : -1) * x.amount, x.note || ""]));
   rows.push([]); rows.push(["Debt", "Owed now", "APR %", "Minimum", "Due day"]);
   S.debts.forEach(d => rows.push([d.name, E.bal(d, today()), d.apr, d.min, d.dueDay]));
   const csv = rows.map(r => r.map(c => /[",\n;]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : c).join(",")).join("\n");
@@ -1350,12 +1450,14 @@ const ACT = {
   newDebt: () => debtModal(null), editDebt: d => debtModal(debt(d.id)), saveDebt: d => saveDebt(d.id),
   delDebt: d => { const x = debt(d.id); modal(`Delete ${esc(x.name)}?`, `<p>Its payments go too. If it's paid off, keep it – it counts toward your progress.</p>`, `<button class="btn" data-act="close">Keep it</button><button class="btn danger" data-act="delOk" data-id="${d.id}">Delete</button>`); },
   delOk: d => { commit(() => { S.debts = S.debts.filter(x => x.id !== d.id); }, "delete debt"); closeModal(); toast("Deleted.", () => undo()); },
-  delPay: d => { const x = debt(d.id); commit(() => { x.history = x.history.filter(h => h.id !== d.h); }, "delete payment"); debtModal(x); toast("Payment deleted.", () => { undo(); closeModal(); }); },
+  delPay: d => { const x = debt(d.id); commit(() => { const h = x.history.find(y => y.id === d.h); if (h && h.bump) x.start = E.r2(Math.max(+x.balance || 0, (+x.start || 0) - h.amount)); x.history = x.history.filter(y => y.id !== d.h); }, "delete payment"); debtModal(x); toast("Payment deleted.", () => { undo(); closeModal(); }); },
   upBal: d => balModal(debt(d.id)),
-  saveBal: d => { const x = debt(d.id), b = num(val("ubB")); if (!(b >= 0)) return bad("Type what you owe."); commit(() => { Object.assign(x, { balance: E.r2(b), asOf: today(), asTs: now() }); if (b > (x.start || 0)) x.start = E.r2(b); }, "balance"); closeModal(); toast(`${esc(x.name)}: ${fmt(b)} – plan updated.`, () => undo()); },
+  saveBal: d => { const x = debt(d.id), b = num(val("ubB")); if (!(b >= 0)) return bad("Type what you owe."); commit(() => { Object.assign(x, { balance: E.r2(b), asOf: today(), asTs: now() }); fitStart(x, today()); }, "balance"); closeModal(); toast(`${esc(x.name)}: ${fmt(b)} – plan updated.`, () => undo()); },
   ics: () => { if (DEMO) return toast("Calendar reminders work in the full tracker."); icsFile(); },
   // payments
   pay: d => payModal(d.id), savePay: () => savePay(),
+  payAsk: d => { if (!PEND) return closeModal(); const h = PEND.h; if (d.v === "yes") { if (h.kind === "charge") h.inb = true; else h.kind = "inbal"; } else h.late = true; payCheck("asked"); },
+  payOver: d => { if (!PEND) return closeModal(); const x = debt(PEND.id), h = PEND.h; if (d.v === "cap") h.amount = E.bal(x, h.date > today() ? h.date : today()); payCheck("over"); },
   payKind: d => { PAYK = d.v; document.querySelectorAll(".kind button").forEach(b => b.classList.toggle("on", b.dataset.v === d.v)); $(".modal h2").textContent = d.v === "charge" ? "Add a new charge" : "Log a payment"; $("#pPlan").classList.toggle("hidden", d.v === "charge"); },
   payDebt: d => { PAYD = d.id; document.querySelectorAll(".modal .cats .cat").forEach(b => b.classList.toggle("on", b.dataset.id === d.id)); $("#pPlan").innerHTML = planBtn(d.id, +d.rest); },
   payFill: d => { const a = $("#pA"); a.value = E.r2(+d.v); a.focus(); },
@@ -1365,7 +1467,7 @@ const ACT = {
        ${+d.v > 0 ? `<button class="item click opt" data-act="payInBal" data-id="${d.id}" data-v="${d.v}"><div class="emo">✓</div><div class="grow"><div class="nm">Already paid – it's in the balance I typed</div><div class="tiny muted">ticks it off without changing what you owe</div></div></button>` : ""}
       <button class="item click opt" data-act="upBal" data-id="${d.id}"><div class="emo">🧾</div><div class="grow"><div class="nm">Update the balance from my statement</div><div class="tiny muted">interest or new charges changed it</div></div></button></div>`); },
   payOther: d => { closeModal(); payModal(d.id, +d.v); },
-  payInBal: d => { const x = debt(d.id); closeModal(); commit(() => { x.history.push({ id: uid(), ts: now(), kind: "inbal", amount: E.r2(+d.v), date: today(), note: "" }); }, "tick off"); toast(`${esc(x.name)} ticked off for this month.`, () => undo()); },
+  payInBal: d => { const x = debt(d.id); closeModal(); commit(() => { const h = { id: uid(), ts: now(), kind: "inbal", amount: E.r2(+d.v), date: today(), note: "" }; x.history.push(h); inbalStart(x, h); }, "tick off"); toast(`${esc(x.name)} ticked off for this month.`, () => undo()); },
   // plan
   method: d => { S.settings.method = d.v; save(); render(); },
   allMonths: () => { VS.all = !VS.all; render(); },
@@ -1378,7 +1480,7 @@ const ACT = {
   // data
   backup: () => backup(), restore: () => { if (DEMO) return toast("This works in the full tracker."); restore(); }, share: () => shareBackup(), install: () => installApp(),
   resetAll: () => { modal("Start fresh?", `<p>This deletes everything in the tracker on this device. Download a backup first if you might want it back.</p>`, `<button class="btn" data-act="backup">Download a backup</button><button class="btn danger" data-act="resetOk">Delete everything</button>`); },
-  resetOk: () => { if (DEMO) return toast("Not in the demo."); const keep = { theme: S.settings.theme, currency: S.settings.currency }; S = blank(); Object.assign(S.settings, keep); OB = { step: 0, d: {} }; flush(); closeModal(); location.hash = ""; render(); },
+  resetOk: () => { if (DEMO) return toast("Not in the demo."); const keep = { theme: S.settings.theme, currency: S.settings.currency }; S = blank(); Object.assign(S.settings, keep); OB = { step: 0, d: {} }; UNDO.length = 0; flush(); closeModal(); location.hash = ""; render(); },
   setTheme: d => { if (!S.setup && !DEMO) obCollect(); S.settings.theme = d.v; save(); render(); }, setDark: d => { S.settings.dark = d.v; save(); render(); },
   // onboarding
   obAdd: d => { obCollect(); OB.d.debts.push(obRow(d.n)); render(); const rows = document.querySelectorAll('.obrow [data-obf="' + (d.n ? "balance" : "name") + '"]'); rows.length && rows[rows.length - 1].focus(); },
@@ -1399,19 +1501,28 @@ document.addEventListener("click", e => {
 let qT = null;
 document.addEventListener("input", e => {
   const el = e.target;
-  if (el.id === "extra") { S.settings.extra = +el.value; save(); clearTimeout(qT); qT = setTimeout(render, 30); return; }
-  if (el.id === "lump") { VS.lump = +el.value; clearTimeout(qT); qT = setTimeout(render, 30); return; }
+  // sliders: while dragging only the numbers change (re-drawing the page would drop the slider); the full page follows on "change"
+  if (el.id === "extra" || el.id === "extraN") {
+    const v = el.id === "extra" ? +el.value : num(el.value); if (!(v >= 0)) return;
+    S.settings.extra = E.r2(v); save();
+    const sl = $("#extra"), nb = $("#extraN");
+    if (el.id === "extraN" && sl) { if (v > +sl.max) sl.max = Math.ceil(v * 2 / 100) * 100; sl.value = v; }
+    if (el.id === "extra" && nb) nb.value = v;
+    clearTimeout(qT); qT = setTimeout(planLive, 30); return;
+  }
+  if (el.id === "lump") { VS.lump = +el.value; clearTimeout(qT); qT = setTimeout(planLive, 30); return; }
   if (el.id === "obExtra") { OB.d.extra = el.value; clearTimeout(qT); qT = setTimeout(() => { const r = $("#obRes"); if (r) r.innerHTML = obPlan(); }, 120); return; }
   if (el.dataset.obf === "name") { const e2 = el.closest(".obrow")?.querySelector(".e"); if (e2) e2.textContent = typeOf(guessType(el.value))[2]; }
 });
 document.addEventListener("change", e => {
   const el = e.target;
   if (el.dataset.set) { setSetting(el.dataset.set, el.value); render(); return; }
+  if (el.id === "extra" || el.id === "extraN" || el.id === "lump") { clearTimeout(qT); if (el.id === "extraN") el.value = S.settings.extra; const id = el.type === "range" ? el.id : ""; render(); const f = id && document.getElementById(id); f && f.focus(); return; }
 });
-addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "z" && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !modalOpen) { e.preventDefault(); undo(); } });
+addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "z" && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && !modalOpen && (S.setup || DEMO)) { e.preventDefault(); undo(); } });
 
 // service worker for offline use (only when served over http/https)
-if ("serviceWorker" in navigator && /^https?:/.test(location.protocol) && !window.BP_NO_SW) addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => { }));
+if ("serviceWorker" in navigator && /^https?:/.test(location.protocol) && !window.BP_NO_SW && !DEMO) addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => { }));
 render();
 </script>
 </body></html>
