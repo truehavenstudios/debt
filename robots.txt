@@ -1,3 +1,0 @@
-User-agent: *
-Disallow: /debt/app-q4n7x2k9/
-Disallow: /app-q4n7x2k9/
